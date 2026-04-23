@@ -1,0 +1,149 @@
+name: Enhance Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_source:
+        description: 'Magnet link (magnet:?...) or m3u8 URL (https://...m3u8)'
+        required: true
+        type: string
+      boomlify_api_key:
+        description: 'Boomlify API key(s), comma-separated for multiple'
+        required: true
+        type: string
+      num_accounts:
+        description: 'Number of TensorPix accounts to create'
+        required: false
+        default: '5'
+        type: string
+      start_num:
+        description: 'Starting account number (for resuming)'
+        required: false
+        default: '1'
+        type: string
+      output_name:
+        description: 'Output filename (without extension)'
+        required: false
+        default: 'enhanced_video'
+        type: string
+
+jobs:
+  enhance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6 hours max
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg aria2
+
+      - name: Install Python dependencies
+        run: |
+          pip install playwright
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Download video from source
+        id: download
+        run: |
+          SOURCE="${{ github.event.inputs.video_source }}"
+          OUTPUT_BASE="${{ github.event.inputs.output_name }}"
+          OUTPUT_FILE="${OUTPUT_BASE}.mp4"
+
+          if echo "$SOURCE" | grep -qi "^magnet:"; then
+            echo "=== Downloading via magnet link (aria2c) ==="
+            # Download via magnet link using aria2c
+            aria2c \
+              --seed-time=0 \
+              --max-download-limit=0 \
+              --dir=./torrent_dl \
+              --console-log-level=notice \
+              --summary-interval=10 \
+              --bt-stop-timeout=300 \
+              --bt-tracker-connect-timeout=10 \
+              --follow-torrent=mem \
+              "$SOURCE"
+
+            # Find the largest video file in the download directory (50MB+ expected)
+            LARGEST=$(find ./torrent_dl -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.avi" -o -name "*.webm" -o -name "*.mov" -o -name "*.flv" -o -name "*.ts" \) -printf '%s %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+            if [ -z "$LARGEST" ]; then
+              # No video extension found, just grab the biggest file overall
+              LARGEST=$(find ./torrent_dl -type f -printf '%s %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
+            fi
+
+            if [ -z "$LARGEST" ]; then
+              echo "ERROR: No files downloaded from magnet link"
+              exit 1
+            fi
+
+            SIZE=$(stat -c%s "$LARGEST")
+            echo "Largest file: $LARGEST ($SIZE bytes)"
+            cp "$LARGEST" "$OUTPUT_FILE"
+
+          elif echo "$SOURCE" | grep -qiE "\.m3u8"; then
+            echo "=== Downloading via m3u8 (ffmpeg) ==="
+            ffmpeg -y \
+              -i "$SOURCE" \
+              -c copy \
+              -bsf:a aac_adtstoasc \
+              -movflags +faststart \
+              "$OUTPUT_FILE"
+
+          elif echo "$SOURCE" | grep -qiE "^https?://"; then
+            echo "=== Direct download via URL ==="
+            aria2c \
+              --out="$OUTPUT_FILE" \
+              --max-connection-per-server=16 \
+              --split=16 \
+              --min-split-size=1M \
+              "$SOURCE"
+
+          else
+            echo "ERROR: Unsupported source format. Use magnet: link, .m3u8 URL, or direct video URL."
+            exit 1
+          fi
+
+          if [ ! -f "$OUTPUT_FILE" ] || [ $(stat -c%s "$OUTPUT_FILE") -lt 1000 ]; then
+            echo "ERROR: Download failed or file too small"
+            exit 1
+          fi
+
+          FILE_SIZE=$(stat -c%s "$OUTPUT_FILE")
+          echo "Downloaded: $OUTPUT_FILE ($FILE_SIZE bytes)"
+          echo "video_file=$OUTPUT_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Run TensorPix Enhancement Bot
+        env:
+          BOOMLIFY_API_KEY: ${{ github.event.inputs.boomlify_api_key }}
+        run: |
+          python3 tensorpix.py \
+            "${{ steps.download.outputs.video_file }}" \
+            ${{ github.event.inputs.num_accounts }} \
+            --start=${{ github.event.inputs.start_num }}
+
+      - name: Upload enhanced video
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: enhanced-video
+          path: |
+            *-4k.mkv
+            *_4k_*.mp4
+          retention-days: 7
+
+      - name: Upload debug screenshots
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: debug-screenshots
+          path: debug_*.png
+          retention-days: 3
